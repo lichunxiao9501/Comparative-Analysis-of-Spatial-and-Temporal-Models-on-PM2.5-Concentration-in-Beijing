@@ -1,0 +1,1882 @@
+---
+title: "Comparative Analysis of Spatial and Temporal Models on PM2.5 Concentration in Beijing"
+author: "Chunxiao Li, Xuetong Li"
+date: "5/3/2018"
+output: html_document
+---
+
+```{r, message=FALSE, warning=FALSE, echo = FALSE}
+### import packages
+library(openxlsx)
+library(dplyr)
+library(ggplot2)
+library(GGally)
+library(forecast)
+library(sf)
+library(spdep)
+library(lwgeom)
+library(tidyverse)
+library(ggplot2)
+library(gridExtra)
+library(knitr)
+library(viridis)
+library(rstan)
+library(rjags)
+library(mice)
+library(tree)
+library(plyr)
+library(zoo)
+library(tidyr)
+suppressMessages(library(randomForest))
+```
+
+```{r, echo=FALSE}
+### self-defined functions
+rmse = function(x){
+  return(sqrt(mean(x^2)))
+}
+
+bin = function(df, var, binwidth, origin = NULL) {
+  n = nrow(df)
+  
+  var = as.character(substitute(var))
+  x = df[[var]]
+  
+  if (is.null(origin)) {
+    origin = min(x)
+  }
+  
+  bin = (x - origin) %/% binwidth
+  indices = unname(split(seq_len(n) - 1, bin))
+  
+  mid = origin + (0:(max(bin)+1)) * binwidth + binwidth/2
+  
+  df[["bin_mid"]] = mid[bin+1]
+  
+  attr(df, "indices") = indices
+  attr(df, "drop") = FALSE
+  attr(df, "group_sizes") = sapply(indices, length)
+  attr(df, "biggest_group_size") = max(attr(df, "group_sizes"))
+  attr(df, "labels") = data.frame(bin = seq_along(indices))
+  attr(df, "vars") = list(quote(bin))
+  class(df) = c("grouped_df", "tbl_df", "tbl", "data.frame")
+  
+  df
+}
+
+dist_long = function(d)
+{
+  d = as.matrix(d)
+  d[upper.tri(d, diag = TRUE)] = NA
+  
+  data.frame(
+    expand.grid(i=1:nrow(d), j=1:nrow(d)),
+    c(d)
+  ) %>%
+    setNames(c("i","j","dist")) %>%
+    filter(!is.na(dist))
+}
+
+emp_semivariogram = function(d, y, x, bin=FALSE, binwidth, range_max)
+{
+  y_col = as.character(substitute(y))
+  x_col = as.character(substitute(x))
+  
+  d = d[[x_col]] %>%
+    dist() %>% 
+    dist_long() %>%
+    mutate(y_i = d[[y_col]][i], y_j = d[[y_col]][j])
+  
+  
+  if (bin)
+  {
+    d = d %>% bin(dist, binwidth = binwidth)
+  } else {
+    d = d %>% mutate(bin_mid = dist) %>% rowwise()
+  }
+  
+  d = d %>%
+    dplyr::summarise(
+      gamma = sum( (y_i - y_j)^2 / (2*n()) ),
+      h = mean(bin_mid),
+      n = n()
+    )
+  
+  if (!missing(range_max))
+    d = d %>% filter(h < range_max)
+  
+  d
+}
+
+nugget_cov   = function(d, sigma2) { ifelse(d==0, sigma2, 0) }
+sq_exp_cov   = function(d, sigma2, l, sigma2_w=0) { sigma2 * exp(-(abs(d)*l)^2) + nugget_cov(d,sigma2_w) }
+sq_exp_sv  = function(d, sigma2, l, sigma2_w) { sigma2 + sigma2_w - sq_exp_cov(d,sigma2,l) - nugget_cov(d,sigma2_w) }
+exp_cov = function(d, sigma2=1, l=1, sigma2_w=0){ sigma2 * exp(-abs(d)*l) + nugget_cov(d,sigma2_w) }
+
+post_summary = function(m, ci_width=0.95) {
+  d = data_frame(
+    post_mean  = apply(m, 2, mean),
+    post_med   = apply(m, 2, median),
+    post_lower = apply(m, 2, quantile, probs=(1-ci_width)/2),
+    post_upper = apply(m, 2, quantile, probs=1 - (1-ci_width)/2)
+  )
+  
+  if (!is.null(colnames(m)))
+    d = d %>% mutate(param = colnames(m)) %>% dplyr::select(param,post_mean:post_upper)
+  
+  d
+}
+
+cond_pred = function(x, y, x_pred, betas, sigma2, l, reps=1000){
+  beta0 = betas[1]
+  beta1 = betas[2]
+
+  mu = beta0 + beta1*x
+  mu_pred = beta0 + beta1*x_pred
+  
+  dist_o = fields::rdist(x)
+  dist_p = fields::rdist(x_pred)
+  dist_op = fields::rdist(x, x_pred)
+  dist_po = t(dist_op)
+    
+  cov_o  = sq_exp_cov(dist_o,  sigma2 = sigma2, l = l, sigma2_w = sigma2_w)
+  cov_p  = sq_exp_cov(dist_p,  sigma2 = sigma2, l = l, sigma2_w = sigma2_w)
+  cov_op = sq_exp_cov(dist_op, sigma2 = sigma2, l = l, sigma2_w = sigma2_w)
+  cov_po = sq_exp_cov(dist_po, sigma2 = sigma2, l = l, sigma2_w = sigma2_w)
+  
+  diag(cov_o) = diag(cov_o) + 1e-6
+  diag(cov_p) = diag(cov_p) + 1e-6
+  
+  cond_cov = cov_p - cov_po %*% solve(cov_o) %*% cov_op
+  cond_mu  = mu_pred + cov_po %*% solve(cov_o) %*% (y - mu)
+    
+  pred = cond_mu %*% matrix(1, ncol=reps) + t(chol(cond_cov)) %*% matrix(rnorm(length(x_pred)*reps), ncol=reps)
+  
+  pred_df = pred %>% t() %>% post_summary() %>% mutate(x=x_pred)
+}
+
+get_coda_parameter = function(coda, pattern){
+  w = coda[[1]] %>% colnames() %>% stringr::str_detect(pattern)
+  coda[[1]][,w,drop=FALSE]
+}
+
+clean_spdynlm = function(m, start, end, thin=1) {
+  m$p.beta.0.samples = window(m$p.beta.0.samples, start, end, thin)
+  m$p.beta.samples = window(m$p.beta.samples, start, end, thin)
+  m$p.sigma.eta.samples = window(m$p.sigma.eta.samples, start, end, thin)
+  m$p.theta.samples = window(m$p.theta.samples, start, end, thin)
+  m$p.y.samples = t(m$p.y.samples) %>% coda::as.mcmc() %>% window(start, end, thin) %>% t()
+  m$p.u.samples = NULL
+  
+  m
+}
+```
+
+## 1. Data Introduction
+
+```{r, echo=FALSE}
+aq = read.csv(file = "Beijing_17/beijing_17_18_aq.csv", 
+              header = TRUE, stringsAsFactors=FALSE)
+meo = read.csv(file = "Beijing_17/beijing_17_18_meo.csv", 
+               header = TRUE, stringsAsFactors=FALSE)
+stations = read.xlsx(xlsxFile = "Beijing_17/Beijing_AirQuality_Stations_en.xlsx", 
+                     colNames = TRUE)
+
+aq = merge(aq, stations, by = "station_id", all.x = TRUE)
+```
+
+In order to build a spatial-temporal model to predict PM2.5 in Beijing, we collect the air quality data and meteorology data from *2017-01-31* to *2018-01-31* in several monitoring stations in Beijing. In addition, in order to analyze the Beijing air pollutants in the district scale, we also get the geographical boundaries data of all the districts in Beijing.
+
+#### 1.1 Beijing Districts
+
+The plot below shows the 18 districts in Beijing, colored by their area and labeled by their English name. The small districts in the middle indicates the city center, while the larger ones along the city boarder are suburban areas.
+
+```{r, echo = FALSE}
+load("Beijing_District/District.Rdata")
+
+District_coords  = districts %>% st_centroid() %>% st_coordinates()
+
+districts %>%
+  ggplot(aes(fill = area, color = area)) + 
+  geom_sf() + 
+  scale_fill_viridis(option = "magma") + 
+  scale_color_viridis(option = "magma") +
+  annotate("text", x = District_coords[,1], y=District_coords[,2], 
+           label = districts$en_name, size = 2.5, color = "grey")+
+  xlab("latitude") + ylab("longitude")
+```
+
+#### 1.2 Air Quality Data
+
+The air quality data are collected from 35 different air quality stations across the city. The distribution of the air quality monitoring stations is not really uniform. More stations are crowded in the city center, while less are located in the larger suburban districts. 
+
+The air quality data includes 6 kinds of pollutants, $PM2.5$, $PM10$, $NO_2$, $CO$, $O_3$ and $SO_2$.
+
+#### 1.3 Meteorology Data
+
+The meteorology data are collected from 18 different meteorology stations across the city. The distribution of the meteorology monitoring stations also concentrates in the city center, but more uniform than that of air quality stations.
+
+The meteorology data includes 6 meteorology parameters, temperature, pressure, humidity, wind direction, wind speed and weather (categorical variable).
+
+The distributions of the air quality and meteorology stations are shown in the following plot.
+
+```{r, echo=FALSE}
+aq_sta = aq %>% group_by(station_id) %>% 
+  dplyr::summarise(lon = unique(longitude),
+            lat = unique(latitude)) %>%
+  mutate(station = "aq")
+
+meo_sta = meo %>% group_by(station_id) %>% 
+  dplyr::summarise(lon = unique(longitude),
+            lat = unique(latitude)) %>%
+  mutate(station = "meo")
+
+sta = rbind(aq_sta, meo_sta) %>% 
+  st_as_sf(coords = c("lon", "lat"),crs = 4326, agr = "constant") %>%
+  st_transform_proj(st_crs(districts)$proj4string)
+
+ggplot() +
+  geom_sf(data = districts) +
+  geom_sf(data = sta, aes(color = station)) 
+```
+
+
+## 2. Data Cleaning
+
+#### 2.1 Clean Air Quality and meteorology Data
+We convert the UTC time to Beijing time, create factor variables, date, month, weekdays, hour from Beijing time, and transform the obviously mistaken expressions (such as '999999') to the missing value expressions, 'NA'. (Code chunk hidden.)
+
+```{r, eval=FALSE,echo=FALSE}
+### data structure
+summary(aq)
+summary(meo)
+
+### clean aq
+aq_cleaned = aq %>% 
+  mutate(utc_time = as.POSIXct(strptime(utc_time, format='%m/%d/%y %H:%M', tz="UTC"))) %>%
+  mutate(beijing_time = as.POSIXct(format(utc_time, tz="Etc/GMT-8",usetz=TRUE), 
+         format='%Y-%m-%d %H:%M:%S', tz="Etc/GMT-8")) %>%
+  mutate(month = month.abb[as.numeric(format(beijing_time, "%m", tz="Etc/GMT-8"))],
+         date = as.Date(beijing_time, tz="Etc/GMT-8"),
+         weekdays = weekdays(date),
+         hour = format(beijing_time, "%H", tz="Etc/GMT-8")) %>%
+  mutate(type = as.factor(type),
+         month = factor(month, levels = month.abb),
+         weekdays = factor(weekdays, levels = weekdays(x=as.Date(seq(7), origin="1950-01-01"))),
+         hour = factor(as.numeric(hour), levels = 0:23))
+
+### clean meo
+meo_cleaned = meo %>% 
+  mutate(temperature = ifelse(temperature == 999999, NA, temperature),
+         pressure = ifelse(pressure == 999999, NA, pressure),
+         humidity = ifelse(humidity == 999999, NA, humidity),
+         wind_direction = ifelse(wind_direction > 999000, NA, wind_direction),
+         wind_speed = ifelse(wind_speed == 999999, NA, wind_speed)) %>%
+  mutate(utc_time = as.POSIXct(strptime(utc_time, format='%Y-%m-%d %H:%M:%S', tz="UTC"))) %>%
+  mutate(beijing_time = as.POSIXct(format(utc_time, tz="Etc/GMT-8",usetz=TRUE), 
+         format='%Y-%m-%d %H:%M:%S', tz="Etc/GMT-8")) %>%
+  mutate(month = month.abb[as.numeric(format(beijing_time, "%m", tz="Etc/GMT-8"))],
+         date = as.Date(beijing_time, tz="Etc/GMT-8"),
+         weekdays = weekdays(date),
+         hour = format(beijing_time, "%H", tz="Etc/GMT-8")) %>%
+  mutate(weather = as.factor(weather),
+         month = factor(month, levels = month.abb),
+         weekdays = factor(weekdays, levels = weekdays(x=as.Date(seq(7), origin="1950-01-01"))),
+         hour = factor(as.numeric(hour), levels = 0:23))
+
+
+### cleaned data structure
+summary(aq_cleaned)
+summary(meo_cleaned)
+
+### save cleaned data
+save(aq_cleaned, file = "cleaned_data/aq_cleaned.Rdata")
+save(meo_cleaned, file = "cleaned_data/meo_cleaned.Rdata")
+```
+
+
+#### 2.2 Combine aq & districts, meo & districts
+We combine the districts data and air quality data, districts data and meteorology data in each monitoring stations respectively. We use longitude and latitude of the air quality and meteorology stations, and locate them in their corresponding districts. (Code chunk hidden.)
+
+```{r, eval=FALSE, echo = FALSE}
+load(file = "cleaned_data/aq_cleaned.Rdata")
+load(file = "cleaned_data/meo_cleaned.Rdata")
+load(file = "Beijing_District/District.Rdata")
+
+### combine meo & districts
+meo_district = meo_cleaned %>% 
+  st_as_sf(coords = c("longitude", "latitude"), 
+                 crs = 4326, agr = "constant") %>%
+  st_transform_proj(st_crs(districts)$proj4string) %>%
+  st_join(districts) %>%
+  as.data.frame() %>%
+  select(-geometry)
+
+### combine aq & districts
+aq_district = aq_cleaned %>%
+  st_as_sf(coords = c("longitude", "latitude"), 
+                 crs = 4326, agr = "constant") %>%
+  st_transform_proj(st_crs(districts)$proj4string) %>%
+  st_join(districts) %>%
+  as.data.frame() %>%
+  select(-geometry)
+
+save(aq_district, file = "cleaned_data/aq_district.Rdata")
+save(meo_district, file = "cleaned_data/meo_district.Rdata")
+```
+
+#### 2.3 Summarise by District and Combine aq & meo
+We first summarise all the obervations of air quality and meteorology data by districts respectively and then combine the air quality and meteorology data in the same districts. (Code chunk hidden.)
+
+```{r, eval=FALSE, echo = FALSE}
+load(file = "cleaned_data/aq_district.Rdata")
+load(file = "cleaned_data/meo_district.Rdata")
+
+### summarise meo by districts
+d1 = meo_district %>%
+  group_by(beijing_time, district_id) %>%
+  dplyr::summarise_at(vars(temperature:wind_speed), mean, na.rm = TRUE)
+
+d2 = meo_district %>%
+  group_by(beijing_time, district_id) %>%
+  dplyr::summarise(weather = names(which.max(table(weather)))) %>%
+  as.data.frame()
+
+d3 = meo_district %>%
+  group_by(beijing_time, district_id) %>%
+  dplyr::summarise_at(vars(month:hour, area:en_name), unique) %>%
+  as.data.frame()
+ 
+meo_dist = list(d1, d2, d3) %>%
+  reduce(function(df1, df2) merge(df1, df2, by = c("district_id", "beijing_time")))
+
+### summarise aq by districts
+d1 = aq_district %>%
+  group_by(beijing_time, district_id) %>%
+  dplyr::summarise_at(vars(PM2.5:SO2), mean, na.rm = TRUE)
+
+d2 = aq_district %>%
+  group_by(beijing_time, district_id) %>%
+  dplyr::summarise(type = names(which.max(table(type)))) %>%
+  as.data.frame()
+
+d3 = aq_district %>%
+  group_by(beijing_time, district_id) %>%
+  dplyr::summarise_at(vars(month:hour, area:en_name), unique) %>%
+  as.data.frame()
+ 
+aq_dist = list(d1, d2, d3) %>%
+  reduce(function(df1, df2) merge(df1, df2, by = c("district_id", "beijing_time")))
+
+### combine aq and meo
+aq_meo_dist = merge(aq_dist %>% select(-(month:en_name)), 
+                    meo_dist, by = c("district_id", "beijing_time"))
+
+save(aq_dist, file = "cleaned_data/aq_dist.Rdata")
+save(meo_dist, file = "cleaned_data/meo_dist.Rdata")
+save(aq_meo_dist, file = "cleaned_data/aq_meo_dist.Rdata")
+```
+
+#### 2.4 Process Missing Values
+We first add missing Beijing time and make the dataset a complete dataset with no missing values in the time variable. Then we fill the missing value with its most recent previous observation respectively in each station. (Code chunk hidden.)
+
+```{r, eval=FALSE, message=FALSE, warning=FALSE, echo = FALSE}
+### add missing beijing_time
+mv = function(data){
+  library(data.table)
+  library(zoo)
+  library(plyr)
+
+  sum_df = data %>% group_by(district_id) %>%
+    dplyr::summarise(start = min(beijing_time), end = max(beijing_time),
+                     max_index = as.numeric(difftime(max(beijing_time), min(beijing_time), units="hours")))
+
+  df = setDT(sum_df)[ , .(district_id = district_id,
+                 beijing_time = seq(start, end, by = "hour"),
+                 index = seq(0, max_index, 1)), by = 1:nrow(sum_df)] %>%
+    select(-nrow)
+  
+  full = merge(df, data,  by = c("district_id", "beijing_time"), all = TRUE)
+  
+  ### replace NaN with NA
+  is.nan.data.frame <- function(x){
+    do.call(cbind, lapply(x, is.nan))
+  }
+  
+  full[is.nan.data.frame(full)] = NA
+  full = full %>% arrange(district_id, beijing_time)
+  
+  full = ddply(full, .(district_id), function(x) 
+    replace(x, TRUE, lapply(x, function(y) na.locf(y, na.rm = FALSE))))
+  
+  full = full[complete.cases(full), ]
+  
+  return(full)
+}
+
+aq_full = mv(aq_dist)
+meo_full = mv(meo_dist)
+
+aq_meo_full = merge(aq_full %>% select(-index, -(month:en_name)), 
+                    meo_full, by = c("district_id", "beijing_time"))
+
+save(aq_meo_full, file = "cleaned_data/aq_meo_full.Rdata")
+```
+
+## 3. Time Series Models
+
+#### 3.1 Select Haidian Data
+In order to analyze PM2.5 in the time series scale, we pick one of the most busy districts in Beijing, Haidian, where most of the univeristies in Beijing locate, as our target district.
+
+We first filter the air quality and meteorology data and get all the observations in Haidian district. Then we summarise Haidian data by date and get daily observations of all the air pollutants and meteorology variables in Haidian district. (Code chunk hidden.)
+
+```{r, echo = FALSE}
+load(file = "cleaned_data/aq_meo_full.Rdata")
+haidian = aq_meo_full %>% filter(en_name == "Haidian")
+
+haidian_date = haidian %>% 
+  group_by(date) %>%
+  dplyr::summarise(PM2.5_mean = mean(PM2.5, na.rm = TRUE),
+            PM2.5_median = median(PM2.5, na.rm = TRUE))
+
+d1 = haidian %>%
+  group_by(date) %>%
+  dplyr::summarise_at(vars(PM2.5:SO2, temperature:wind_speed), mean, na.rm = TRUE)
+
+d2 = haidian %>%
+  group_by(date) %>%
+  dplyr::summarise_at(vars(type, weather), function(x) names(which.max(table(x)))) %>%
+  as.data.frame()
+
+d3 = haidian %>%
+  group_by(date) %>%
+  dplyr::summarise_at(vars(month, weekdays), unique) %>%
+  as.data.frame()
+
+haidian_date = list(d1, d2, d3) %>%
+  reduce(function(df1, df2) merge(df1, df2, by = c("date"))) %>%
+  arrange(date) %>%
+  mutate(index = seq(0, nrow(d1)-1, 1)) %>%
+  mutate(weather = factor(weather, levels = unique(weather)))
+```
+
+#### 3.2 EDA
+
+The plots below shows the monthly, weekly, and daily trend of PM2.5 concentration.
+
+```{r, echo = FALSE}
+ggplot(haidian, 
+       aes(x = beijing_time, y = PM2.5, group = month, color = month)) +
+  geom_point() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))
+
+ggplot(haidian, aes(x = beijing_time, y = PM2.5, group = weekdays, color = weekdays)) +
+  geom_point() +
+  geom_line() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))
+
+ggplot(haidian, aes(x = beijing_time, y = PM2.5, group = hour, color = hour)) +
+  geom_point() +
+  geom_line() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))
+```
+
+
+#### 3.3 ARIMA
+In the following steps, we build ARIMA(1,1,0) model for Haidian hourly PM2.5 data and ARIMA(0,0,2) model for Haidian daily PM2.5 data respectively. The specific steps of models selections is shown in the code below, but will not be illustrated in detailed here.
+
+The selection process, fitted plot, and rmse of ARIMA(1,1,0) model is shown below:
+```{r, echo = FALSE, warning =FALSE}
+### haidian
+forecast::ggtsdisplay(haidian$PM2.5, lag.max = 36,
+                      main = "Haidian Hourly PM2.5")
+
+### differencing
+m1 = forecast::Arima(haidian$PM2.5, order = c(0,1,0))
+forecast::ggtsdisplay(haidian$PM2.5 - m1$fitted, lag.max = 36,
+                      main = "Haidian Hourly PM2.5 Residuals of ARIMA(0,1,0)")
+
+### choose between ARIMA(1,1,0) and ARIMA(0,1,1), and select ARIMA(1,1,0) with lower AIC
+m2 = forecast::Arima(haidian$PM2.5, order = c(1,1,0))
+forecast::ggtsdisplay(haidian$PM2.5 - m2$fitted, lag.max = 36,
+                      main = "Haidian Hourly PM2.5 Residuals of ARIMA(1,1,0)")
+
+### fit model
+haidian = haidian %>%
+  mutate(arima_fit = m2$fitted)
+ggplot(haidian, aes(x = beijing_time, y = arima_fit)) +
+  geom_point(color = "red") +
+  geom_line(color = "red") +
+  geom_line(aes(x = beijing_time, y = PM2.5), color = "black") +
+  ggtitle("Haidian Hourly PM2.5 Model Fitting")
+
+print(paste0("The RMSE of the ARIMA(1,1,0) model of the Haidian hourly PM2.5 data is ", rmse(haidian$PM2.5 - haidian$arima_fit)))
+```
+
+The selection process, fitted plot, and rmse of ARIMA(0,0,2) model is shown below:
+```{r, echo = FALSE, warning=FALSE}
+### haidian date
+forecast::ggtsdisplay(haidian_date$PM2.5, lag.max = 36,
+                      main = "Haidian Daily PM2.5")
+
+### choose between ARIMA(1,0,0) and ARIMA(0,0,1), and select ARIMA(0,0,1) with lower AIC
+m1 = forecast::Arima(haidian_date$PM2.5, order = c(0,0,1))
+forecast::ggtsdisplay(haidian_date$PM2.5 - m1$fitted, lag.max = 36,
+                      main = "Haidian Daily PM2.5 Residuals of ARIMA(0,0,1)")
+
+### ARIMA(0,0,2)
+m2 = forecast::Arima(haidian_date$PM2.5, order = c(0,0,2))
+forecast::ggtsdisplay(haidian_date$PM2.5 - m2$fitted, lag.max = 36,
+                      main = "Haidian Daily PM2.5 Residuals of ARIMA(0,0,2)")
+
+
+### fit model
+haidian_date = haidian_date %>%
+  mutate(arima_fit = m2$fitted)
+ggplot(haidian_date, aes(x = date, y = arima_fit)) +
+  geom_point(color = "red") +
+  geom_line(color = "red") +
+  geom_line(aes(x = date, y = PM2.5), color = "black") +
+  ggtitle("Haidian Daily PM2.5 Model Fitting")
+
+print(paste0("The RMSE of the ARIMA(0,0,2) model of the Haidian daily PM2.5 data is ", rmse(haidian_date$PM2.5 - haidian_date$arima_fit)))
+```
+
+
+#### 3.4 Gaussian Process
+In the following steps, we build a Guassian Process model using the daily PM2.5 and time data only. Since the jags model is too long to run, we read the parameters, $l$, $\sigma^2$ and $\sigma^2_w$ from the variogram plots directly. Below is the variogram plots:
+
+```{r, echo = FALSE, warning=FALSE}
+######## variogram plot
+d_emp = rbind(
+  haidian_date %>% emp_semivariogram(PM2.5, index, bin=TRUE, binwidth=1)  %>% mutate(binwidth="binwidth=1"),
+  haidian_date %>% emp_semivariogram(PM2.5, index, bin=TRUE, binwidth=5) %>% mutate(binwidth="binwidth=5"),
+  haidian_date %>% emp_semivariogram(PM2.5, index, bin=TRUE, binwidth=10)   %>% mutate(binwidth="binwidth=10"),
+  haidian_date %>% emp_semivariogram(PM2.5, index, bin=TRUE, binwidth=20)  %>% mutate(binwidth="binwidth=20")
+)
+
+d_emp %>%
+  mutate(pred = sq_exp_sv(h, sigma2 = 500, l = sqrt(3)/5, sigma2_w = 1300)) %>%
+  ggplot(aes(x=h, y=gamma)) +
+  geom_point(size = 0.5) +
+  geom_line(aes(y = pred), color = "red") +
+  facet_wrap(~binwidth, nrow=2) + ylim(c(0, 6000)) +
+  ggtitle("Variogram Plots")
+```
+
+We pick $\sigma^2 = 500$, $l = \sqrt{3}/5,$ and $\sigma^2_w = 1300$ to fit the Gaussian Process. Below is the full posterior predictive distribution plot of Haidian daily PM2.5.
+
+```{r, echo = FALSE, message=FALSE, warning=FALSE}
+######## pred
+reps=1000
+
+sigma2 = 500
+l = sqrt(3)/5
+sigma2_w = 1300
+
+lm = lm(PM2.5~index, data = haidian_date)
+betas = lm$coef
+
+x = haidian_date$index
+y = haidian_date$PM2.5
+x_pred = seq(0, 365, 0.2)
+
+pred_df_emp = cond_pred(x, y, x_pred, betas, sigma2, l, reps=1000)
+
+ggplot(haidian_date, aes(x=index, y=PM2.5)) +
+  geom_line() +
+  geom_point() +
+  geom_line(data=pred_df_emp, aes(x=x,y=post_mean), color='red', size=0.5) +
+  geom_ribbon(data=pred_df_emp, aes(ymin=post_lower,ymax=post_upper, x=x, y=post_med), fill="red", alpha=0.2)
+
+pred = cond_pred(x, y, x_pred = seq(0, 365, 1), betas, sigma2, l, reps=1000)$post_mean
+
+gp = rmse(pred+lm$fitted-haidian_date$PM2.5)
+
+print(paste0("The RMSE of the Gaussian Process model of the Haidian daily PM2.5 data is ", gp))
+```
+
+From the above plot, we can see that the prediction of PM2.5 is clearly overfitted, which may result from inaccurate estimation of parameter $l$.
+
+#### 3.5 Linear Regression and Guassian Process
+In the following step, we first build a linear regression model based on other air pollutants and the weather conditions. The specific exploratory data analysis (EDA) and model selection procudures is shown in the codes below, but will not be illustrated in detailed here.
+
+Then we use the residuals of the linear regression model to build a Gaussian Process model to add the time-related autoregression part of PM2.5 data.
+
+Theoretically, the hierarchical model is a better choice. However, considering the computational cost and the capacity of our laptops, we have to abandon the Bayesian methods.
+
+The following plots show the EDA part, and the results show the model selection procedures. We use the selected model as our final model to further predict its residual using Gaussian Process.
+
+```{r, echo = FALSE, message=FALSE, warning=FALSE}
+### EDA
+ggpairs(
+  haidian[,3:8],
+  lower = list(continuous = wrap("points", alpha = 0.3, size=0.1), 
+              combo = wrap("dot", alpha = 0.4, size=0.2))
+)
+
+ggpairs(
+  haidian[,c(3,11:16)],
+  lower = list(continuous = wrap("points", alpha = 0.3, size=0.1), 
+              combo = wrap("dot", alpha = 0.4, size=0.2))
+)
+```
+
+We start with the selected linear model:
+```{r, echo = FALSE, message=FALSE, warning=FALSE}
+###
+lm1 = lm(PM2.5 ~ PM10+NO2+CO+O3+SO2+temperature+pressure+humidity+wind_direction+wind_speed+weather, data = haidian_date)
+
+#print(paste0("The RMSE of the full linear regression model of the Haidian daily PM2.5 data is ", rmse(resid(lm1))))
+
+
+lm2 = lm(PM2.5 ~ PM10+NO2+CO+O3+pressure+humidity+wind_direction, data = haidian_date)
+summary(lm2)
+print(paste0("The RMSE of the selected linear regression model of the Haidian daily PM2.5 data is ", rmse(resid(lm2))))
+
+haidian_date = haidian_date %>% mutate(resid = resid(lm2)) 
+gp_linear = rmse(pred+lm2$fitted-haidian_date$PM2.5)
+```
+
+Then we use the residual of the selected linear model to conduct Gaussian Process. To start, below are the variogram plots that we use to decide parameters:
+
+```{r, echo = FALSE, message=FALSE, warning=FALSE}
+######## variogram plot
+d_emp = rbind(
+  haidian_date %>% emp_semivariogram(resid, index, bin=TRUE, binwidth=1)  %>% mutate(binwidth="binwidth=1"),
+  haidian_date %>% emp_semivariogram(resid, index, bin=TRUE, binwidth=5) %>% mutate(binwidth="binwidth=5"),
+  haidian_date %>% emp_semivariogram(resid, index, bin=TRUE, binwidth=10)   %>% mutate(binwidth="binwidth=10"),
+  haidian_date %>% emp_semivariogram(resid, index, bin=TRUE, binwidth=20)  %>% mutate(binwidth="binwidth=20")
+)
+
+d_emp %>%
+  mutate(pred = sq_exp_sv(h, sigma2 = 50, l = sqrt(3)/5, sigma2_w = 130)) %>%
+  ggplot(aes(x=h, y=gamma)) +
+  geom_point(size = 0.5) +
+  geom_line(aes(y = pred), color = "red") +
+  facet_wrap(~binwidth, nrow=2) + ylim(c(0, 500)) +
+  ggtitle("Variogram Plots")
+```
+
+We set $\sigma^2 = 50$, $l = \sqrt{3}/5$ and $\sigma^2_w = 130$, and fit Gaussian Process model on the linear regression residuals. The fitted values and the rmse are given below:
+
+```{r, echo = FALSE, message=FALSE, warning=FALSE}
+######## pred
+reps=1000
+
+sigma2 = 50
+l = sqrt(3)/5
+sigma2_w = 130
+
+lm3 = lm(resid~index, data = haidian_date)
+betas = lm3$coef
+
+x = haidian_date$index
+y = haidian_date$resid
+x_pred = seq(0, 365, 0.2)
+
+pred_df_emp = cond_pred(x, y, x_pred, betas, sigma2, l, reps=1000)
+
+ggplot(haidian_date, aes(x=index, y=resid)) +
+  geom_line() +
+  geom_point() +
+  geom_line(data=pred_df_emp, aes(x=x,y=post_mean), color='red', size=0.5) +
+  geom_ribbon(data=pred_df_emp, aes(ymin=post_lower,ymax=post_upper, x=x, y=post_med), fill="red", alpha=0.2)
+
+pred = cond_pred(x, y, x_pred = seq(0, 365, 1), betas, sigma2, l, reps=1000)$post_mean
+
+gp_linear = rmse(pred+lm2$fitted-haidian_date$PM2.5)
+
+print(paste0("The RMSE of the Linear Regression and Guassian Process model of the Haidian daily PM2.5 data is ", gp_linear))
+```
+
+From the above plot, we can see that the prediction of the linear regression residuals is clearly overfitted, which may result from inaccurate estimation of parameter $l$.
+
+If possible, the hierarchical model with enough number of iterations can provide more accurate estimation of Gaussian Process parameters. However, due to the limit of our laptop, we can only run 100 interations of jags in the following part, which has obviously not converged.
+
+#### 3.6 Beyasian Gaussaian Process
+In the following steps, we run the hierarchical model for 100 iterations. The estimations and fitted values are given below. Obviously, the mcmc chain has not coverged.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+gp_exp_model = "model{
+  y ~ dmnorm(mu, inverse(Sigma))
+
+  for (i in 1:N) {
+    mu[i] <- beta[1]+ beta[2] * x[i]
+  }
+  
+  for (i in 1:(N-1)) {
+    for (j in (i+1):N) {
+      Sigma[i,j] <- sigma2 * exp(- pow(l*d[i,j],2))
+      Sigma[j,i] <- Sigma[i,j]
+    }
+  }
+
+  for (k in 1:N) {
+    Sigma[k,k] <- sigma2 + sigma2_w
+  }
+
+  for (i in 1:3) {
+    beta[i] ~ dt(0, 2.5, 1)
+  }
+  sigma2_w ~ dnorm(10, 1/25) T(0,)
+  sigma2   ~ dnorm(10, 1/25) T(0,)
+  l        ~ dt(0, 2.5, 1) T(0,) 
+}"
+
+if (file.exists("gp_jags.Rdata"))
+{
+  load(file="gp_jags.Rdata")
+} else {
+  m = rjags::jags.model(
+    textConnection(gp_exp_model), 
+    data = list(
+      y = haidian_date$PM2.5,
+      x = haidian_date$index,
+      d = dist(haidian_date$index) %>% as.matrix(),
+      N = nrow(haidian_date)
+    ),
+    quiet = TRUE
+  )
+
+  update(m, n.iter=50)#, progress.bar="none")
+
+  exp_cov_coda = rjags::coda.samples(
+    m, variable.names=c("beta", "sigma2", "l", "sigma2_w"),
+    n.iter=100, thin=10#, progress.bar="none"
+  )
+  save(exp_cov_coda, file="gp_jags.Rdata")
+}
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+betas = tidybayes::gather_samples(exp_cov_coda, beta[i]) %>%
+  ungroup() %>%
+  mutate(term = paste0(term, "[",i,"]")) %>%
+  dplyr::select(-i)
+params = tidybayes::gather_samples(exp_cov_coda, sigma2, l, sigma2_w)
+post = bind_rows(betas, params) %>%
+  group_by(term) %>%
+  dplyr::summarize(
+    post_mean = mean(estimate),
+    post_med  = median(estimate),
+    post_lower = quantile(estimate, probs = 0.025),
+    post_upper = quantile(estimate, probs = 0.975)
+  )
+
+knitr::kable(post, digits = 3)
+
+l = post %>% filter(term == 'l') %>% pull(post_med)
+sigma2 = post %>% filter(term == 'sigma2') %>% pull(post_med)
+sigma2_w = post %>% filter(term == 'sigma2_w') %>% pull(post_med)
+
+beta0 = post %>% filter(term == 'beta[1]') %>% pull(post_med)
+beta1 = post %>% filter(term == 'beta[2]') %>% pull(post_med)
+betas = c(beta0, beta1)
+haidian_date = haidian_date %>% mutate(bayes_resid = y - beta0 - beta1 * x )
+
+pred_df = cond_pred(x, y, x_pred, betas, sigma2, l, reps=1000)
+
+ggplot(haidian_date, aes(x=x, y=y)) +
+  geom_line() +
+  geom_point() +
+  geom_line(data=pred_df, aes(x = x, y=post_mean), color='blue', size=0.5) +
+  geom_ribbon(data=pred_df, aes(ymin=post_lower,ymax=post_upper, x=x, y=post_med), fill="blue", alpha=0.1)
+```
+
+
+#### 3.7 Random Forest
+In the following steps, we build a random forest model to predict the PM2.5 concentration. The detailed model selection procedures will not be illustrated.
+
+The full model and selected model important variables, and rmse are show below:
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# fit a random forest model with all the other pollutants and weather conditions variable
+rf = randomForest(PM2.5 ~ PM10 + NO2 + CO + O3 + SO2 + temperature + pressure + humidity + wind_direction + wind_speed + weather,
+                      data = haidian_date, mtry = 2, importance = TRUE)
+# important variables
+varImpPlot(rf)
+
+# variable selection
+rf = randomForest(PM2.5 ~ PM10 + CO+ humidity,
+                      data = haidian_date, mtry = 2, importance = TRUE)
+# important variables
+varImpPlot(rf)
+
+# random forest prediction
+rf.pred = predict(rf, newdata = haidian_date)
+
+rf_resid = rmse(rf.pred-haidian_date$PM2.5)
+print(paste0("The RMSE of the random forest model of the Haidian hourly PM2.5 data is ", rf_resid))
+```
+
+From the above result, we can see that the random forest model performs better than the linear model and the pure Gaussian Process model with only historical PM2.5 data, but is not as good as the combination of linear regression and Gaussian process model.
+
+#### 3.8 Temporal Models RMSE Comparison
+
+The RMSE of all the temporal models are summarised as follows:
+
+```{r, echo = FALSE}
+model = c("Hourly ARIMA", "Daily ARIMA", "Daily Gaussian Process",
+          "Daily lm Gaussian Process", "Daily Random Forest")
+model_rmse = c(rmse(haidian$PM2.5 - haidian$arima_fit),
+               rmse(haidian_date$PM2.5 - haidian_date$arima_fit), gp,
+               gp_linear, rmse(rf.pred-haidian_date$PM2.5))
+
+data.frame(model, model_rmse) %>% kable(col.names = c("Model", "RMSE"))
+```
+
+The Bayesian Gaussian Process that did not converge is not included.
+
+Among all the temporal models, the lm Gaussian Process model using air quality data has the lowest rmse and fitted our PM2.5 data the most. However, due to extreme low RMSE and its highly closed predicted & observed lines, we can say that overfitting problem does exist.
+
+## 4. Spatial Models
+
+### 4.1 Spatial Introduction
+
+In order to build the spatial models, we pick *2017-10-03* as our target date, and try to fit spatial models (areal and point reference) for the PM2.5 concentration. The following plots show the PM2.5 concentration in each station points and the average PM2.5 of all the stations in each districts respectively, where the color illustrates the daily average PM2.5 concentration in $\mu g/m^3$.
+
+```{r, echo = FALSE}
+load("cleaned_data/aq_cleaned.Rdata")
+
+OneDay_df = aq_cleaned %>% filter(date == "2017-10-03") %>% 
+  group_by(station_id) %>% 
+  dplyr::summarize(PM2.5 = mean(PM2.5, na.rm = TRUE), PM10 = mean(PM10, na.rm = TRUE),
+         NO2 = mean(NO2,na.rm = TRUE), CO = mean(CO, na.rm = TRUE), 
+         O3 = mean(O3, na.rm = TRUE), SO2 = mean(SO2, na.rm = TRUE),
+         longitude = unique(longitude), latitude = unique(latitude),
+         type = unique(type))
+
+OneDay_sf = OneDay_df %>% 
+  st_as_sf(coords = c("longitude", "latitude"),crs = 4326, agr = "constant") %>%
+  st_transform_proj(st_crs(districts)$proj4string)
+
+p1 = ggplot() +
+  geom_sf(data = districts) +
+  geom_sf(data = OneDay_sf, aes(color = PM2.5)) 
+
+within = st_within(OneDay_sf, districts) %>% unlist()
+OneDay_df$district_id = within
+District_aq = OneDay_df %>% group_by(district_id) %>% 
+  dplyr::summarize(PM2.5 = mean(PM2.5, na.rm = TRUE), PM10 = mean(PM10, na.rm = TRUE),
+         NO2 = mean(NO2,na.rm = TRUE), CO = mean(CO, na.rm = TRUE), 
+         O3 = mean(O3, na.rm = TRUE), SO2 = mean(SO2, na.rm = TRUE))
+
+areal_aq = District_aq %>% 
+  mutate(geometry = districts$geometry) %>% 
+  st_as_sf()
+
+p2 = ggplot() + 
+  geom_sf(data=areal_aq, aes(fill=PM2.5))
+
+grid.arrange(p1, p2, nrow = 1)
+```
+
+### 4.2 Areal Models
+
+For areal models, we consider the districts that touch each other as neighbors. However, since the shapefile is not official and has some intersecting boundaries, we consider the districts that either touch or overlap as neighbors. Below shows the resulted adjacency plot, where the neighbors are connected by the red lines.
+
+```{r, echo = FALSE}
+W = st_overlaps(districts, sparse = FALSE) | st_touches(districts, sparse = FALSE)
+listw = mat2listw(W)
+
+plot(st_geometry(areal_aq))
+plot(listw, District_coords, add = TRUE, col = "red", pch = 20)
+```
+
+We first conduct Moran I test and Geary C test to see if there exists spatial autocorrelation: 
+
+```{r}
+moran.test(areal_aq$PM2.5, listw)
+geary.test(areal_aq$PM2.5, listw)
+```
+
+Both p-values are significant, so spatial autocorrelation exists. Since Moran I is positive and Geary C is smaller than one, we have positive spatial autocorrelation.
+
+
+
+
+#### 4.2.1 CAR and SAR models
+
+First we conduct CAR and SAR models using `spautolm` and only PM 2.5 concentrations.
+
+```{r}
+mod_car = spautolm(formula = areal_aq$PM2.5~1, listw = listw, family = "CAR")
+summary(mod_car)
+
+mod_sar = spautolm(formula = areal_aq$PM2.5~1, listw = listw, family = "SAR")
+summary(mod_sar)
+```
+
+
+Both are significant at 0.05 significance level, and the positive lambda's indicate positive autocorrelation, which accords with our Moran I and Geary C test. The fitted values and residuals are shown below, and the two models provide similar results.
+
+```{r, echo = FALSE}
+areal_aq$car_pred = mod_car$fit$fitted.values
+areal_aq$sar_pred = mod_sar$fit$fitted.values
+
+areal_aq$car_resid = mod_car$fit$residuals
+areal_aq$sar_resid = mod_sar$fit$residuals
+
+p1 = ggplot() + 
+  geom_sf(data=areal_aq, aes(fill=car_pred))
+p2 = ggplot() + 
+  geom_sf(data=areal_aq, aes(fill=car_resid))
+p3 = ggplot() + 
+  geom_sf(data=areal_aq, aes(fill=sar_pred))
+p4 = ggplot() + 
+  geom_sf(data=areal_aq, aes(fill=sar_resid))
+grid.arrange(p1, p2, p3, p4, nrow = 2)
+```
+
+And we check that the spatial autocorrelation of the residuals are not significant:
+
+```{r}
+moran.test(areal_aq$car_resid , listw)$p.value
+moran.test(areal_aq$sar_resid , listw)$p.value
+```
+
+
+#### 4.2.2 Bayesian CAR model
+
+Then we move on to the Bayesian version of CAR model using `stan` with 10000 iterations.
+
+```{r message=FALSE, echo=FALSE}
+car_model = "
+data {
+  int<lower=0> N;
+  vector[N] y;
+  matrix[N,N] W;
+  matrix[N,N] D;
+}
+parameters {
+  vector[N] w_s;
+  real beta;
+  real<lower=0> sigma2;
+  real<lower=0> sigma2_w;
+  real<lower=0,upper=1> phi;
+}
+transformed parameters {
+  vector[N] y_pred = beta + w_s;
+}
+model {
+  matrix[N,N] Sigma_inv = (D - phi * W) / sigma2;  
+
+  w_s ~ multi_normal_prec(rep_vector(0,N), Sigma_inv);
+
+  beta ~ normal(0,10);
+  sigma2 ~ cauchy(0,5);
+  sigma2_w ~ cauchy(0,5);
+  
+  y ~ normal(beta+w_s, sigma2_w);
+}
+"
+
+data = list(
+  N = nrow(areal_aq),
+  y = areal_aq$PM2.5,
+  W = W * 1,
+  D = diag(rowSums(W))
+)
+```
+
+```{r, echo = FALSE}
+if (!file.exists("stan_car.rds")) {
+  car_fit = rstan::stan(
+    model_code = car_model, data = data,
+    iter = 10000, chains = 1, thin=20
+  )
+  saveRDS(car_fit, "stan_car.rds")
+} else {
+  car_fit = readRDS("stan_car.rds")
+}
+```
+
+The estimation, prediction and residuals are shown below:
+```{r, echo=FALSE, warning=FALSE}
+car_params = tidybayes::gather_samples(car_fit, beta, phi, sigma2, sigma2_w)
+
+post = car_params %>%
+  group_by(term) %>%
+  dplyr::summarize(
+    post_mean = mean(estimate),
+    post_med  = median(estimate),
+    post_lower = quantile(estimate, probs = 0.025),
+    post_upper = quantile(estimate, probs = 0.975)
+  )
+kable(post, digits = 3)
+
+p3 = ggplot(car_params, aes(x=.iteration, y=estimate, color=term)) +
+  geom_line() +
+  facet_grid(term~., scales="free_y") +
+  guides(color=FALSE)
+
+car_y_pred = tidybayes::gather_samples(car_fit, y_pred[i])
+
+areal_aq = car_y_pred %>%
+  ungroup() %>%
+  filter(.chain == 1) %>% 
+  group_by(i) %>% 
+  dplyr::summarize(
+    bayes_car_pred = mean(estimate)
+  ) %>% 
+  bind_cols(areal_aq, .) %>%
+  mutate(
+    bayes_car_resid = PM2.5 - bayes_car_pred
+  )
+
+p1 = ggplot() + 
+  geom_sf(data=areal_aq, aes(fill=bayes_car_pred))
+
+p2 = ggplot() + 
+  geom_sf(data=areal_aq, aes(fill=bayes_car_resid))
+
+grid.arrange(p1, p2, p3, nrow = 2)
+```
+
+The traceplots of beta and phi reasonably behaved, while the variances terms are relatively large. The range of the resiuals is obviously narrower than the previous CAR model. So the Stan CAR model fits the data better.
+
+#### 4.2.3 Bayesian SAR model
+
+Similarly, we fit the Bayesian version of SAR model using `stan`.
+
+```{r, echo=FALSE}
+sar_model = "
+data {
+  int<lower=0> N;
+  vector[N] y;
+  matrix[N,N] W_tilde;
+  matrix[N,N] D;
+}
+transformed data {
+  matrix[N,N] I = diag_matrix(rep_vector(1, N));
+}
+parameters {
+  vector[N] w_s;
+  real beta;
+  real<lower=0> sigma2;
+  real<lower=0> sigma2_w;
+  real<lower=0,upper=1> phi;
+}
+transformed parameters {
+  vector[N] y_pred = beta + w_s;
+}
+model {
+  matrix[N,N] C = I - phi * W_tilde;
+  matrix[N,N] Sigma_inv = C' * D * C / sigma2;  
+  
+  w_s ~ multi_normal_prec(rep_vector(0,N), Sigma_inv);
+
+  beta ~ normal(0,10);
+  sigma2 ~ cauchy(0,5);
+  sigma2_w ~ cauchy(0,5);
+
+  y ~ normal(beta + w_s, sigma2_w);
+}
+"
+
+D = diag(rowSums(W))
+D_inv = diag(1/diag(D))
+data = list(
+  N = nrow(areal_aq),
+  y = areal_aq$PM2.5,
+  x = rep(1, nrow(areal_aq)),
+  D_inv = D_inv,
+  W_tilde = D_inv %*% W
+)
+```
+
+```{r, echo = FALSE}
+if (!file.exists("stan_sar.rds")) {
+  sar_fit = rstan::stan(
+    model_code = sar_model, data = data,
+    iter = 10000, chains = 1, thin=20
+  )
+  saveRDS(sar_fit, "stan_sar.rds")
+} else {
+  sar_fit = readRDS("stan_sar.rds")
+}
+```
+
+The estimation, prediction and residuals are shown below:
+
+```{r, echo=FALSE, warning=FALSE}
+sar_params = tidybayes::gather_samples(sar_fit, beta, phi, sigma2, sigma2_w)
+
+post = sar_params %>%
+  group_by(term) %>%
+  dplyr::summarize(
+    post_mean = mean(estimate),
+    post_med  = median(estimate),
+    post_lower = quantile(estimate, probs = 0.025),
+    post_upper = quantile(estimate, probs = 0.975)
+  )
+kable(post, digits = 3)
+
+
+p3 = ggplot(sar_params, aes(x=.iteration, y=estimate, color=term)) +
+  geom_line() +
+  facet_grid(term~., scales="free_y") +
+  guides(color=FALSE)
+
+sar_y_pred = tidybayes::gather_samples(sar_fit, y_pred[i])
+
+areal_aq = sar_y_pred %>%
+  ungroup() %>%
+  filter(.chain == 1) %>% 
+  group_by(i) %>% 
+  dplyr::summarize(
+    bayes_sar_pred = mean(estimate)
+  ) %>% 
+  bind_cols(areal_aq, .) %>%
+  mutate(
+    bayes_sar_resid = PM2.5 - bayes_sar_pred
+  )
+
+p1 = ggplot() + 
+  geom_sf(data=areal_aq, aes(fill=bayes_sar_pred))
+
+p2 = ggplot() + 
+  geom_sf(data=areal_aq, aes(fill=bayes_sar_resid))
+
+grid.arrange(p1, p2, p3, nrow = 2)
+```
+
+The traceplots of SAR model converges somewhat better than the CAR one. Again, beta and phi seems reasonable while the sigma's are quite large. Compared to the frequentist SAR, The range of the resiuals is obviously narrower. So the Stan SAR model fits the data better.
+
+#### 4.2.4 Spatial GLM with air quality data
+
+We first conduct backward selction on the linear regression of air quality variables. Variable `PM10` and `CO` are found as the best predictors and are used in the spatial GLM. The spaital CAR model is used with 500000 iterations.
+
+```{r, echo = FALSE}
+full=lm(PM2.5~PM10+NO2+CO+O3+SO2, data=District_aq)
+mod_lm = step(full, data=imputed_df, direction="backward", trace = 0)
+D = diag(rowSums(W))
+X = model.matrix(~scale(District_aq %>% dplyr::select(names(mod_lm$coefficients)[-1])))
+y = District_aq$PM2.5
+```
+
+```{r, echo=FALSE}
+car_model = "model{
+  for(i in 1:length(y)) {
+    y[i] ~ dnorm(mu[i],inv.var)
+    y_pred[i] ~ dnorm(mu[i],inv.var)
+    mu[i] <- X[i,] %*% beta + omega[i]
+  }
+
+  for(i in 1:3) {
+    beta[i] ~ dnorm(0,1)
+  }
+
+  omega ~ dmnorm(rep(0,length(y)), tau * (D - phi*W))
+  sigma2 = 1/tau
+  tau ~ dgamma(2, 2)
+  phi ~ dunif(0,0.99)
+  inv.var ~ dgamma(0.01, 0.01)
+}"
+```
+
+```{r, echo = FALSE}
+if (!file.exists("car_lm_model.Rdata")) {
+  m = rjags::jags.model(
+    textConnection(car_model), 
+    data = list(
+      D = D,
+      y = y,
+      X = X,
+      W = W
+    ),
+    n.adapt=25000
+  )
+
+  update(m, n.iter=25000)#, progress.bar="none")
+  
+  car_coda = rjags::coda.samples(
+    m, variable.names=c("sigma2","tau", "beta", "omega", "phi", "y_pred"),
+    n.iter=500000, thin=500
+  )
+  save(car_coda, m, file="car_lm_model.Rdata")
+} else {
+  load("car_lm_model.Rdata")
+}
+```
+
+The estimation, prediction and residuals are shown below:
+
+```{r, echo = FALSE}
+beta_params = tidybayes::gather_samples(car_coda,beta[i]) %>%
+  ungroup() %>%
+  mutate(term = paste0(term,"[",i,"]"))
+
+ar_params = tidybayes::gather_samples(car_coda,sigma2,phi)
+
+post = bind_rows(beta_params, ar_params) %>%
+  group_by(term) %>%
+  dplyr::summarize(
+    post_mean = mean(estimate),
+    post_med  = median(estimate),
+    post_lower = quantile(estimate, probs = 0.025),
+    post_upper = quantile(estimate, probs = 0.975)
+  )
+
+kable(post, digits = 3)
+
+p1 = ggplot(beta_params, aes(x=.iteration, y=estimate, color=term)) +
+  geom_line() +
+  facet_grid(term~., scales="free_y") +
+  guides(color=FALSE)
+
+p2 = ggplot(ar_params, aes(x=.iteration, y=estimate, color=term)) +
+  geom_line() +
+  facet_grid(term~., scales="free_y") +
+  guides(color=FALSE)
+
+y_pred = tidybayes::gather_samples(car_coda,y_pred[i])
+
+areal_aq = areal_aq %>% 
+  mutate(
+    car_lm_pred = y_pred %>% dplyr::summarize(pred = mean(estimate)) %>% pull(pred), 
+    car_lm_resid = PM2.5 - car_lm_pred)
+
+p3 = ggplot() + 
+  geom_sf(data=areal_aq, aes(fill=car_lm_pred))
+
+p4 = ggplot() + 
+  geom_sf(data=areal_aq, aes(fill=car_lm_resid))
+
+grid.arrange(p1, p2, p3, p4, nrow = 2)
+```
+
+The traceplots looks fairly reasonable. Compared to the previous CAR and SAR models, The range of the resiuals is obviously narrower. However, we should consider overfitting problem for residuals this small.
+
+#### 4.2.5 Spatial GLM with air quality and meteorology data
+
+Now we introduce the meterology data into our model. We first conduct backward selction on the linear regression of both air quality and meteorolgy variables. Variables `pressure`, `wind_direction`, `PM10`, `NO2`, and `SO2` are found as the best predictors and are used in the spatial GLM. The same CAR model is used for the spatial part and 500000 iterations are taken. 
+
+```{r, echo = FALSE}
+# prepare data
+load("cleaned_data/meo_cleaned.Rdata")
+
+OneDay_meo_df = meo_cleaned %>% filter(date == "2017-10-03") %>% 
+  group_by(station_id) %>% 
+  dplyr::summarise(temperature = mean(temperature, na.rm = TRUE), 
+            pressure = mean(pressure, na.rm = TRUE),
+            humidity = mean(humidity,na.rm = TRUE), 
+            wind_speed = mean(wind_speed, na.rm = TRUE),
+            wind_direction = mean(wind_direction, na.rm=TRUE),
+         longitude = unique(longitude), latitude = unique(latitude))
+
+OneDay_meo_sf = OneDay_meo_df %>% 
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326, agr = "constant") %>%
+  st_transform_proj(st_crs(districts)$proj4string)
+
+within = st_within(OneDay_meo_sf, districts) %>% unlist()
+OneDay_meo_df$district_id = within
+District_aqmeo = OneDay_meo_df %>% group_by(district_id) %>% 
+  dplyr::summarise(temperature = mean(temperature, na.rm = TRUE), 
+          pressure = mean(pressure, na.rm = TRUE),
+          humidity = mean(humidity,na.rm = TRUE), 
+          wind_speed = mean(wind_speed, na.rm = TRUE),
+          wind_direction = mean(wind_direction, na.rm=TRUE)) %>% 
+  merge(areal_aq, by = "district_id")
+
+# linear model
+full2=lm(PM2.5~temperature+pressure+humidity+wind_speed+wind_direction+
+        PM10+NO2+CO+O3+SO2, data=District_aqmeo)
+mod_lm2 = step(full2, data=District_aqmeo, direction="backward", trace = 0)
+```
+
+```{r, echo = FALSE}
+# spatial model
+W_aq = W
+listw_aq = listw
+W = W[District_aqmeo$district_id, District_aqmeo$district_id]
+listw = mat2listw(W)
+D = diag(rowSums(W))
+X = model.matrix(~scale(District_aqmeo %>% dplyr::select(names(mod_lm2$coefficients)[-1])))
+y = District_aqmeo$PM2.5
+
+car_model = "model{
+  for(i in 1:length(y)) {
+    y[i] ~ dnorm(mu[i],inv.var)
+    y_pred[i] ~ dnorm(mu[i],inv.var)
+    mu[i] <- X[i,] %*% beta + omega[i]
+  }
+
+  for(i in 1:6) {
+    beta[i] ~ dnorm(0,1)
+  }
+
+  omega ~ dmnorm(rep(0,length(y)), tau * (D - phi*W))
+  sigma2 = 1/tau
+  tau ~ dgamma(2, 2)
+  phi ~ dunif(0,0.99)
+  inv.var   ~ dgamma(0.01, 0.01)
+}"
+```
+
+```{r, echo = FALSE}
+if (!file.exists("car_lm_meo_model.Rdata")) {
+  m = rjags::jags.model(
+    textConnection(car_model), 
+    data = list(
+      D = D,
+      y = y,
+      X = X,
+      W = W
+    ),
+    n.adapt=25000
+  )
+
+  update(m, n.iter=25000)#, progress.bar="none")
+  
+  car_coda = rjags::coda.samples(
+    m, variable.names=c("sigma2","tau", "beta", "omega", "phi", "y_pred"),
+    n.iter=500000, thin=500
+  )
+  save(car_coda, m, file="car_lm_meo_model.Rdata")
+} else {
+  load("car_lm_meo_model.Rdata")
+}
+```
+
+The estimation, prediction and residuals are shown below:
+
+```{r, echo = FALSE}
+beta_params = tidybayes::gather_samples(car_coda,beta[i]) %>%
+  ungroup() %>%
+  mutate(term = paste0(term,"[",i,"]"))
+
+ar_params = tidybayes::gather_samples(car_coda,sigma2,phi)
+
+post = bind_rows(beta_params, ar_params) %>%
+  group_by(term) %>%
+  dplyr::summarise(
+    post_mean = mean(estimate),
+    post_med  = median(estimate),
+    post_lower = quantile(estimate, probs = 0.025),
+    post_upper = quantile(estimate, probs = 0.975)
+  )
+
+kable(post, digits = 3)
+
+p1 = ggplot(beta_params, aes(x=.iteration, y=estimate, color=term)) +
+  geom_line() +
+  facet_grid(term~., scales="free_y") +
+  guides(color=FALSE)
+
+p2 = ggplot(ar_params, aes(x=.iteration, y=estimate, color=term)) +
+  geom_line() +
+  facet_grid(term~., scales="free_y") +
+  guides(color=FALSE)
+
+y_pred = tidybayes::gather_samples(car_coda,y_pred[i])
+
+District_aqmeo = District_aqmeo %>% 
+  mutate(
+    car_lm_pred = y_pred %>% dplyr::summarise(pred = mean(estimate)) %>% pull(pred), 
+    car_lm_resid = PM2.5 - car_lm_pred
+  )%>% 
+  st_as_sf() %>%
+  st_transform_proj(st_crs(districts)$proj4string)
+
+p3 = ggplot() + 
+  geom_sf(data=District_aqmeo, aes(fill=car_lm_pred))
+
+p4 = ggplot() + 
+  geom_sf(data=District_aqmeo, aes(fill=car_lm_resid))
+
+grid.arrange(p1, p2, p3, p4, nrow = 2)
+```
+
+Similar to previous model, the traceplots looks fairly reasonable. Compared to the previous CAR and SAR models, The range of the resiuals is obviously narrower. However, we should consider overfitting problem for residuals this small and for this many of predictors. Also, since we don't have meteorology data for the central four districts, no fitted vlaues are provided.
+
+
+#### 4.2.6 Areal models rmse comparison
+
+We summarize the rmse and residual Moran I of each areal model in the kable below:
+
+```{r, echo = FALSE}
+model = c("CAR", "SAR", "Bayesian CAR", "Bayesian SAR",
+          "aq lm CAR", "aq_meo lm CAR")
+model_rmse = c(rmse(areal_aq$car_resid), rmse(areal_aq$sar_resid),
+  rmse(areal_aq$bayes_car_resid), rmse(areal_aq$bayes_sar_resid),
+  rmse(areal_aq$car_lm_resid), rmse(District_aqmeo$car_lm_resid))
+model_moran = c(moran.test(areal_aq$car_resid, listw_aq)$estimate[1], 
+              moran.test(areal_aq$sar_resid, listw_aq)$estimate[1],
+              moran.test(areal_aq$bayes_car_resid, listw_aq)$estimate[1],
+              moran.test(areal_aq$bayes_sar_resid, listw_aq)$estimate[1],
+              moran.test(areal_aq$car_lm_resid, listw_aq)$estimate[1],
+              moran.test(District_aqmeo$car_lm_resid, listw)$estimate[1])
+
+data.frame(model, model_rmse, model_moran) %>% kable(col.names = c("Model", "RMSE","Moran"))
+```
+
+
+The Spatial GLM model using air quality data has the lowest rmse and fitted our PM2.5 data the most, but we do suspect overfitting for rmse this small. The SAR model has the residual Moran I closest to 0, so it captured the spatial autocorrelation in the data best. In general, the Bayesian SAR model might be our best pick, since it's rmse is reasonably small and residual Moran I close to 0.
+
+
+### 4.3 Point reference
+
+Since we have 35 stations all over Beijing, it is possible for us to fit a point reference model and try to get a heat map for PM2.5 concentration across the city.
+
+#### 4.3.1 TPS Model
+
+We first divide Beijing into $150\times 200$ grids using `raster`, and fit a Thin Plate Splines model using `fields::Tps` with PM2.5 concentration only. The fitted plot is shown below, with the true PM2.5 data marked as points under the same color scale. We can see that the fitted values show obvious spatial trend, and the color of the true values matches the background in general.
+
+```{r, warning = FALSE, echo = FALSE}
+r = raster::raster(nrows=150, ncol=200,
+           xmn = min(OneDay_df$longitude)*0.95, xmx = max(OneDay_df$longitude)*1.05,
+           ymn = min(OneDay_df$latitude )*0.95, ymx = max(OneDay_df$latitude )*1.05)
+
+Beijing = raster::rasterize(as(st_transform(districts, 4326), "Spatial"), r)
+
+cells = which(!is.na(Beijing[]))
+pred_coords = raster::xyFromCell(r, cells)
+
+coords = dplyr::select(OneDay_df, long=longitude, lat=latitude) %>% as.matrix()
+tps = fields::Tps(x = coords, Y=OneDay_df$PM2.5)
+
+PM2.5_pred = r
+PM2.5_pred[cells] = predict(tps, pred_coords)
+
+PM2.5_pred_df = as(PM2.5_pred, "SpatialPixelsDataFrame") %>% 
+  as.data.frame() %>%
+  dplyr::select(long=x, lat=y, PM2.5 = layer)
+
+
+ggplot(mapping = aes(x=long, y=lat)) +
+  geom_tile(data=PM2.5_pred_df, aes(fill=PM2.5))+
+  scale_fill_viridis_c(name = "Fitted Value") +
+  geom_point(data=as.data.frame(coords), aes(color = OneDay_df$PM2.5))+
+  scale_color_viridis_c(begin = 0, end = 0.8, name = "True PM2.5")
+
+OneDay_df = OneDay_df %>% 
+  mutate(
+    tps_pred = predict(tps, coords), 
+    tps_resid = PM2.5 - tps_pred
+  )
+
+
+```
+
+#### 4.3.2 JAGS spatial GP
+
+To use Gaussian Process model, we need to check if the data is stationary and isotropic. According to the plot below, it seems reasonable for us to make these assumptions.
+
+
+```{r, echo = FALSE, warning=FALSE}
+par(mfrow = c(1, 2))
+d = fields::rdist(coords)
+
+geoR::variog(coords = coords, data = OneDay_df$PM2.5, messages = FALSE, 
+       uvec = seq(0, max(d)/2, length.out=50)) %>% plot()
+
+v4 = geoR::variog4(coords = coords, data = OneDay_df$PM2.5, messages = FALSE,
+             uvec = seq(0, max(d)/4, length.out = 10))
+plot(v4)
+```
+
+Then we move on to a Gaussian Process spatial model with exponential covariance function model using `Jags`. The model is specified below and only PM2.5 concentration is used. The pior of $\phi$ is set according to the variogram above.
+
+```{r, echo=FALSE}
+gplm = "model{
+  for(i in 1:length(y)){
+    y[i] ~ dnorm(beta + w[i], tau)
+    y_pred[i] ~ dnorm(beta + w[i], tau)
+    mu_w[i] = 0
+  }
+ 
+  for(i in 1:length(y)){
+    for(j in 1:length(y)){
+      Sigma_w[i,j] = sigma2_w * exp(-phi * d[i,j])
+    }
+  }
+  w ~ dmnorm(mu_w, inverse(Sigma_w))
+
+  beta ~ dnorm(0, 1/1000)
+  sigma2_w ~ dgamma(2, 2)
+  sigma2 ~ dgamma(2, 2)
+  tau = 1/sigma2
+  phi ~ dunif(3/0.6, 3/0.05)
+}"
+```
+
+```{r, echo=FALSE, warning = FALSE}
+if (!file.exists("gplm.Rdata")) {
+  m = jags.model(
+    textConnection(gplm), 
+    data = list(
+      d = as.matrix(dist(coords)),
+      y = OneDay_df$PM2.5
+    ),
+    n.adapt=5000
+  )
+
+  update(m, n.iter=5000)#, progress.bar="none")
+  
+  gplm_coda = coda.samples(
+    m, variable.names=c("sigma2", "sigma2_w", "phi", "beta", "y_pred"),
+    n.iter=5000, thin=5
+  )
+  save(gplm_coda, file="gplm.Rdata")
+} else {
+  load("gplm.Rdata")
+}
+
+# Prediciton
+y_pred = tidybayes::gather_samples(gplm_coda,y_pred[i])
+OneDay_df = OneDay_df %>% 
+  mutate(
+    gplm_pred = y_pred %>% dplyr::summarise(pred = mean(estimate)) %>% pull(pred), 
+    gplm_resid = PM2.5 - gplm_pred
+  )
+```
+
+The estimation and prediction are shown below. The fitted plot has true PM2.5 data marked as black points. We can see that less general trend is indicated, and the PM2.5 concentration at locations without air quality stations generally takes the average value.
+
+```{r, echo = FALSE, warning=FALSE}
+params = tidybayes::gather_samples(gplm_coda, beta, sigma2, phi, sigma2_w)
+post = params %>%
+  group_by(term) %>%
+  dplyr::summarise(
+    post_mean = mean(estimate),
+    post_med  = median(estimate),
+    post_lower = quantile(estimate, probs = 0.025),
+    post_upper = quantile(estimate, probs = 0.975)
+  )
+kable(post, digits = 3)
+
+phi = post %>% filter(term == 'phi') %>% pull(post_med)
+sigma2 = post %>% filter(term == 'sigma2') %>% pull(post_med)
+sigma2_w = post %>% filter(term == 'sigma2_w') %>% pull(post_med)
+beta0 = post %>% filter(term == 'beta') %>% pull(post_med)
+
+OneDay_df = OneDay_df %>% mutate(bayes_resid = PM2.5 - beta0)
+
+mu = beta0
+mu_pred = beta0
+
+dist_o = fields::rdist(coords)
+dist_p = fields::rdist(pred_coords)
+dist_op = fields::rdist(coords, pred_coords)
+dist_po = t(dist_op)
+
+cov_o  = exp_cov(dist_o,  sigma2 = sigma2, l = phi, sigma2_w = sigma2_w)
+cov_p  = exp_cov(dist_p,  sigma2 = sigma2, l = phi, sigma2_w = sigma2_w)
+cov_op = exp_cov(dist_op, sigma2 = sigma2, l = phi, sigma2_w = sigma2_w)
+cov_po = exp_cov(dist_po, sigma2 = sigma2, l = phi, sigma2_w = sigma2_w)
+
+cond_cov = cov_p - cov_po %*% solve(cov_o) %*% cov_op
+cond_mu  = mu_pred + cov_po %*% solve(cov_o) %*% (OneDay_df$PM2.5 - mu)
+  
+reps=1000
+pred = cond_mu %*% matrix(1, ncol=reps) + t(chol(cond_cov)) %*% matrix(rnorm(nrow(pred_coords)*reps), ncol=reps)
+
+pred_df = pred %>% t() %>% post_summary()
+
+gp_jags_pred = r
+gp_jags_pred[cells] = pred_df$post_med
+
+gp_jags_pred_df = as(gp_jags_pred, "SpatialPixelsDataFrame") %>% 
+  as.data.frame() %>%
+  dplyr::select(long=x, lat=y, PM2.5 = layer)
+
+ggplot(mapping = aes(x=long, y=lat)) +
+  geom_tile(data=gp_jags_pred_df, aes(fill=PM2.5))+
+  scale_fill_viridis_c() +
+  geom_point(data=as.data.frame(coords))
+```
+
+
+#### 4.3.3 spBayes spatial GP
+
+Finally we repeat Gaussian Process spatial model with exponential covariance function model using `spBayes`. Only the PM2.5 concentration is used in the model fitting. (Acceptance rate is within a reasonable range.)
+
+```{r, echo = FALSE}
+n = nrow(OneDay_df)
+n_samp = 100000
+max_range = max(dist(coords)) / 4
+
+starting = list(phi = 3/0.1, sigma.sq = 10, tau.sq = 1)
+tuning = list("phi"=0.1, "sigma.sq"=0.1, "tau.sq"=0.1)
+priors = list(
+  beta.Norm = list(0, 1000), 
+  phi.Unif = c(3/(max_range), 3/(0.05)), 
+  sigma.sq.IG = c(2, 2), 
+  tau.sq.IG = c(2, 2)
+)
+
+mod_spBayes = spBayes::spLM(PM2.5 ~ 1, data = OneDay_df, coords = coords, 
+                            starting = starting, priors = priors, 
+                            cov.model = "exponential", n.samples = n_samp, 
+                            tuning = tuning,n.report = n_samp/2, verbose=FALSE)
+mod_spBayes = spBayes::spRecover(mod_spBayes, start=n_samp/2+1, thin = (n_samp/2)/1000,
+                                 verbose=FALSE)
+cat("Report interval Metrop. Acceptance rate:", mean(mod_spBayes$acceptance))
+```
+
+The estimates and predictions are shown below:
+
+```{r, echo = FALSE}
+p1 = mod_spBayes$p.theta.recover.samples %>%
+  tidybayes::gather_samples(sigma.sq, tau.sq, phi) %>%
+  ggplot(aes(x=.iteration, y=estimate, color=term)) +
+    geom_line() +
+    facet_grid(term~., scales = "free_y") +
+    guides(color=FALSE)
+
+p2 = mod_spBayes$p.beta.recover.samples %>%
+  tidybayes::gather_samples(`(Intercept)`) %>%
+  ggplot(aes(x=.iteration, y=estimate, color=term)) +
+    geom_line() +
+    facet_grid(term~., scales = "free_y") +
+    guides(color=FALSE)
+grid.arrange(p1, p2, nrow = 1)
+```
+
+
+```{r, echo = FALSE}
+m_pred = spBayes::spPredict(mod_spBayes, coords, 
+                            pred.covars = matrix(1, nrow=nrow(coords)), 
+                   start=n_samp/2+1, thin=(n_samp/2)/1000, verbose=FALSE)
+m_pred_summary = post_summary(t(m_pred$p.y.predictive.samples))
+
+
+OneDay_df = OneDay_df %>% 
+  mutate(
+    spBayes_pred = m_pred_summary$post_mean, 
+    spBayes_resid = PM2.5 - spBayes_pred
+  )
+```
+
+```{r, echo =FALSE, warning = FALSE}
+if (!file.exists("splm.Rdata")) {
+  m_pred = spBayes::spPredict(mod_spBayes, pred_coords, 
+                              pred.covars = matrix(1, nrow=nrow(pred_coords)),
+                    start=n_samp/2+1, thin=(n_samp/2)/1000)
+  m_pred_summary = post_summary(t(m_pred$p.y.predictive.samples))
+
+  save(m_pred_summary, file="splm.Rdata")
+} else {
+  load("splm.Rdata")
+}
+
+splm_pm25_pred = r
+splm_pm25_pred[cells] = m_pred_summary$post_med
+
+splm_pm25_pred_df = as(splm_pm25_pred, "SpatialPixelsDataFrame") %>% 
+  as.data.frame() %>%
+  dplyr::select(long=x, lat=y, PM2.5 = layer)
+
+ggplot(data = splm_pm25_pred_df, aes(long, lat)) +
+  geom_tile(data=splm_pm25_pred_df, aes(fill=PM2.5))+
+  scale_fill_viridis_c() +
+  geom_point(data=as.data.frame(coords))
+```
+
+The fitted map indicates overfitting, since the plot is even less smoothed than the Jags GP model, and for locations other than the air quality stations, the PM2.5 concentration is assigned average level with random noise.
+
+
+#### 4.3.4 Point reference models rmse comparison
+```{r, echo = FALSE}
+model = c("TPS", "JAGS GP", "spBayes GP")
+model_rmse = c(rmse(OneDay_df$tps_resid), rmse(OneDay_df$gplm_resid),
+               rmse(OneDay_df$spBayes_resid))
+
+data.frame(model, model_rmse) %>% kable(col.names = c("Model", "RMSE"))
+```
+
+According to the rmse of areal data, the rmse of TPS and JAGS GP seems reasonably well. However, the extremly low rmse of spBayes GP suggests overfitting, which accords with our fitted map.
+
+
+## 5. Spatial-temporal Model
+
+#### 5.1 Monthly data by district
+In order to build a spatial-temporal model, we use monthly average data of all the air pollutants in each air quality stations by averaging all the observations thoughout each month.
+
+We first create the data frame of monthly observations of all the pollutants. (Code chunk hidden)
+```{r, eval=FALSE, echo=FALSE}
+load(file = "cleaned_data/aq_cleaned.Rdata")
+
+aq_cleaned = aq_cleaned %>%
+  mutate(year_mon = as.Date(paste0(format(as.Date(date), "%Y-%m"),"-01")))
+
+d1 = aq_cleaned %>% 
+  group_by(station_id, year_mon) %>%
+  dplyr::summarise_at(vars(PM2.5:SO2), mean, na.rm = TRUE)
+  
+d2 = aq_cleaned %>% 
+  group_by(station_id, year_mon) %>%
+  dplyr::summarise_at(vars(type), function(x) names(which.max(table(x)))) %>%
+  as.data.frame()
+
+d3 = aq_cleaned %>% 
+  group_by(station_id, year_mon) %>%
+  dplyr::summarise_at(vars(longitude, latitude, month), unique) %>%
+  as.data.frame()
+
+aq_mon = list(d1, d2, d3) %>%
+  reduce(function(df1, df2) merge(df1, df2, 
+                                  by = c("station_id", "year_mon"))) %>%
+  arrange(station_id, year_mon) %>%
+  mutate(index = rep(seq(0, 12, 1), length(unique(station_id))))
+
+### replace NaN with NA
+  is.nan.data.frame <- function(x){
+    do.call(cbind, lapply(x, is.nan))
+  }
+  
+  aq_mon[is.nan.data.frame(aq_mon)] = NA
+  aq_mon = aq_mon %>% arrange(station_id, year_mon)
+  
+  aq_mon = ddply(aq_mon, .(station_id), function(x) 
+    replace(x, TRUE, lapply(x, function(y) na.locf(y, na.rm = FALSE))))
+  
+  aq_mon = aq_mon[complete.cases(aq_mon), ]
+  
+  aq_mon = aq_mon %>% dplyr::select(-month, -year_mon, -type)
+
+save(aq_mon, file = "cleaned_data/aq_mon.Rdata")
+```
+
+```{r, echo = FALSE}
+load("cleaned_data/aq_mon.Rdata")
+
+aq_df = reshape(aq_mon, idvar = c("station_id", "longitude", "latitude"), timevar = "index", direction = "wide", sep = "_")
+```
+
+The following plots give us a rough idea about how the PM2.5 concentration varies in different month and different stations.
+```{r, echo = FALSE}
+aq_df %>%
+  dplyr::select(longitude, latitude, PM2.5_0, PM2.5_4, PM2.5_7, PM2.5_12) %>%
+  reshape(varying=c("PM2.5_0", "PM2.5_4", "PM2.5_7", "PM2.5_12"), timevar = "month",
+          direction="long", sep="_") %>%
+  ggplot() +
+    geom_point(aes(x=longitude, y=latitude, color=PM2.5)) +
+    facet_wrap(~month)
+
+aq_df %>%
+  .[c(1, 10, 20, 30), ] %>%
+  dplyr::select(station_id, longitude, latitude, names(aq_df)[str_detect(names(aq_df), "PM2.5")]) %>%
+  reshape(varying=names(aq_df)[str_detect(names(aq_df), "PM2.5")], timevar = "month",
+          direction="long", sep="_") %>%
+  mutate(month = stringr::str_replace(month,"PM2.5_","") %>% as.integer()) %>%
+  ggplot() +
+    geom_point(aes(x=month, y=PM2.5, color=station_id)) +
+    geom_line(aes(x=month, y=PM2.5, color=station_id, group=station_id))
+```
+
+#### 5.2 Model fitting
+
+We use the important variables, $PM10$, $SO_2$ and $CO$, that we get from the random forest model to build a dynamic spatial-temporal model of PM2.5 concentration.
+
+```{r, eval = FALSE, echo=FALSE}
+# inputs
+coords = dplyr::select(aq_df, longitude, latitude) %>% as.matrix()
+max_range = max(dist(coords)) / 4
+max_d = coords %>% dist() %>% max()
+n_t = 13
+n_s = nrow(aq_df)
+n_beta = 4
+starting = list(
+  beta = rep(0, n_t * n_beta), phi = rep(3/(max_d/4), n_t),
+  sigma.sq = rep(1, n_t), tau.sq = rep(1, n_t), 
+  sigma.eta = diag(0.01, n_beta)
+)
+tuning = list(phi = rep(1, n_t))
+priors = list(
+  beta.0.Norm = list(rep(0, n_beta), diag(1000, n_beta)), 
+  phi.Unif = list(rep(3/(0.9 * max_d), n_t), rep(3/(0.1 * max_d), n_t)), 
+  sigma.sq.IG = list(rep(2, n_t), rep(2, n_t)), 
+  tau.sq.IG = list(rep(2, n_t), rep(2, n_t)),
+  sigma.eta.IW = list(2, diag(0.001, n_beta))
+)
+n_samples = 10000
+models = lapply(paste0("PM2.5_", 0:12, "~PM10_", 0:12, "+SO2_", 0:12, "+CO_", 0:12), as.formula)
+
+m = spBayes::spDynLM(
+  models, data = aq_df, coords = coords, get.fitted = TRUE,
+  starting = starting, tuning = tuning, priors = priors,
+  cov.model = "exponential", n.samples = n_samples, n.report = 1000, verbose=FALSE)
+
+m = clean_spdynlm(m, n_samples/2+1, n_samples, (n_samples/2)/1000)
+
+save(m, file = "sp_temp_mod.Rdata")
+```
+
+```{r, echo = FALSE}
+load("sp_temp_mod.Rdata")
+```
+
+The following plots demonstrate the posterior inference of $\beta$'s, $\theta$ and the predicted value. From the observed v.s. predited plot, we can see that, our estimation is not very accurate, which may be because of inappropriate start point or prior of $\phi$.
+
+```{r, echo = FALSE}
+betas = m$p.beta.samples %>% 
+  post_summary() %>%
+  mutate(
+    month = stringr::str_extract(param,"t[0-9]+") %>%
+      stringr::str_extract("[0-9]+") %>% as.integer(),
+    param = stringr::str_extract(param,"\\(.*\\)|PM10|SO2|CO")
+  )
+
+p1 = ggplot(betas, aes(x=month, y=post_mean, color=param)) +
+  geom_point(size=2) +
+  geom_linerange(aes(ymin = post_lower, ymax = post_upper)) +
+  facet_wrap(~param, scale="free_y")
+
+#####
+theta = m$p.theta.samples %>% 
+  post_summary() %>%
+  mutate(
+    month = stringr::str_extract(param,"[0-9]+") %>% as.integer(),
+    param = stringr::str_extract(param,"sigma\\.sq|tau\\.sq|phi")
+  )
+eff_range = theta %>% 
+  filter(param == "phi") %>%
+  mutate(
+    param = "Eff. Range",
+    post_mean = 3/post_mean,
+    post_med = NA,
+    tmp = post_lower,
+    post_lower = 3/post_upper,
+    post_upper = 3/tmp
+  ) %>%
+  dplyr::select(-tmp)
+
+theta = rbind(theta, eff_range)
+
+p2 = ggplot(theta, aes(x=month, y=post_mean, color=param)) +
+  geom_point(size=2) +
+  geom_linerange(aes(ymin = post_lower, ymax = post_upper)) +
+  facet_wrap(~param, scale="free_y", nrow=3)
+
+#####
+y_hat = m$p.y.samples %>% 
+  t() %>% coda::as.mcmc() %>%
+  post_summary() %>%
+  bind_cols(
+    aq_mon,
+    .
+  )
+
+p3 = ggplot(y_hat, aes(x=PM2.5, y=post_mean)) +
+  geom_point(size=1, alpha=0.5) +
+  ylab("posterior mean") +
+  geom_abline(slope = 1, intercept=0, color="black", alpha=0.2, size=2) +
+  ggtitle("Observed v.s. Predicted")
+
+grid.arrange(p1, p2)
+p3
+```
+
+
+## 6. Summary
+
+Among all the temporal models, the lm Gaussian Process model using air quality data has the lowest rmse and fitted our PM2.5 data the most. However, due to extreme low RMSE and its highly closed predicted & observed lines, we can say that overfitting problem does exist.
+
+Among areal spatial models, the Spatial GLM model using air quality data has the lowest rmse and fitted our PM2.5 data the most, but we do suspect overfitting for rmse this small. The SAR model has the residual Moran I closest to 0, so it captured the spatial autocorrelation in the data best. In general, the Bayesian SAR model might be our best pick, since it's rmse is reasonably small and residual Moran I close to 0.
+
+Among point reference models, the TPS model best shows the general spatial trend of PM2.5 concentration in Beijing. While the extremly low rmse of spBayes GP suggests overfitting, which accords with our fitted map.
+
+For the spatial-temporal model, the inappropriate start point or prior of $\phi$ leads to the large $\phi$ estimation, and the resulted prediction is unsatisfying. In the future, we may try exploring better starting point for prior of $\phi$. 

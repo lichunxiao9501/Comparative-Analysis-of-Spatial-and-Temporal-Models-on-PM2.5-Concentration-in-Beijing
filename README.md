@@ -25,7 +25,7 @@ This projects consist of five major parts:
 * Spatial Analysis 
 * Spatial-temporal Analysis.
 
-### 3 Models Details
+### 3 Modelling Details
 
 #### 3.1 Temporal Models
 In order to analyze PM2.5 in the time series scale, we pick one of the most busy districts in Beijing, Haidian, where most of the univeristies in Beijing locate, as our target district.

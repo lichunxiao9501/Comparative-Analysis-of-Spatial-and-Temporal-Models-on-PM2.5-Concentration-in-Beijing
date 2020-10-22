@@ -21,8 +21,8 @@ In this project, we built a spatial-temporal model to predict PM2.5 in Beijing b
 This projects consist of five major parts: 
 * Data Introduction
 * Data Cleaning
-* Time Series Analysis (ARIMA, Linear Regressiona and Gussian Process, Bayesian Gussian Process, Random Forest)
-* Spatial Analysis (Area Models, CAR and SAR Models, Bayesian CAR and SAR Models, Spatial GLM)
+* Time Series Analysis 
+* Spatial Analysis 
 * Spatial-temporal Analysis.
 
 ### 3 Models Details

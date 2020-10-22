@@ -175,11 +175,11 @@ clean_spdynlm = function(m, start, end, thin=1) {
 ## 1. Data Introduction
 
 ```{r, echo=FALSE}
-aq = read.csv(file = "Beijing_17/beijing_17_18_aq.csv", 
+aq = read.csv(file = "raw_data/Beijing_17/beijing_17_18_aq.csv", 
               header = TRUE, stringsAsFactors=FALSE)
-meo = read.csv(file = "Beijing_17/beijing_17_18_meo.csv", 
+meo = read.csv(file = "raw_data/Beijing_17/beijing_17_18_meo.csv", 
                header = TRUE, stringsAsFactors=FALSE)
-stations = read.xlsx(xlsxFile = "Beijing_17/Beijing_AirQuality_Stations_en.xlsx", 
+stations = read.xlsx(xlsxFile = "raw_data/Beijing_17/Beijing_AirQuality_Stations_en.xlsx", 
                      colNames = TRUE)
 
 aq = merge(aq, stations, by = "station_id", all.x = TRUE)
@@ -192,7 +192,7 @@ In order to build a spatial-temporal model to predict PM2.5 in Beijing, we colle
 The plot below shows the 18 districts in Beijing, colored by their area and labeled by their English name. The small districts in the middle indicates the city center, while the larger ones along the city boarder are suburban areas.
 
 ```{r, echo = FALSE}
-load("Beijing_District/District.Rdata")
+load("raw_data/Beijing_District/District.Rdata")
 
 District_coords  = districts %>% st_centroid() %>% st_coordinates()
 
@@ -301,7 +301,7 @@ We combine the districts data and air quality data, districts data and meteorolo
 ```{r, eval=FALSE, echo = FALSE}
 load(file = "cleaned_data/aq_cleaned.Rdata")
 load(file = "cleaned_data/meo_cleaned.Rdata")
-load(file = "Beijing_District/District.Rdata")
+load(file = "raw_data/Beijing_District/District.Rdata")
 
 ### combine meo & districts
 meo_district = meo_cleaned %>% 
@@ -724,9 +724,9 @@ gp_exp_model = "model{
   l        ~ dt(0, 2.5, 1) T(0,) 
 }"
 
-if (file.exists("gp_jags.Rdata"))
+if (file.exists("output/gp_jags.Rdata"))
 {
-  load(file="gp_jags.Rdata")
+  load(file="output/gp_jags.Rdata")
 } else {
   m = rjags::jags.model(
     textConnection(gp_exp_model), 
@@ -745,7 +745,7 @@ if (file.exists("gp_jags.Rdata"))
     m, variable.names=c("beta", "sigma2", "l", "sigma2_w"),
     n.iter=100, thin=10#, progress.bar="none"
   )
-  save(exp_cov_coda, file="gp_jags.Rdata")
+  save(exp_cov_coda, file="output/gp_jags.Rdata")
 }
 ```
 
@@ -981,14 +981,14 @@ data = list(
 ```
 
 ```{r, echo = FALSE}
-if (!file.exists("stan_car.rds")) {
+if (!file.exists("output/stan_car.rds")) {
   car_fit = rstan::stan(
     model_code = car_model, data = data,
     iter = 10000, chains = 1, thin=20
   )
-  saveRDS(car_fit, "stan_car.rds")
+  saveRDS(car_fit, "output/stan_car.rds")
 } else {
-  car_fit = readRDS("stan_car.rds")
+  car_fit = readRDS("output/stan_car.rds")
 }
 ```
 
@@ -1087,14 +1087,14 @@ data = list(
 ```
 
 ```{r, echo = FALSE}
-if (!file.exists("stan_sar.rds")) {
+if (!file.exists("output/stan_sar.rds")) {
   sar_fit = rstan::stan(
     model_code = sar_model, data = data,
     iter = 10000, chains = 1, thin=20
   )
-  saveRDS(sar_fit, "stan_sar.rds")
+  saveRDS(sar_fit, "output/stan_sar.rds")
 } else {
-  sar_fit = readRDS("stan_sar.rds")
+  sar_fit = readRDS("output/stan_sar.rds")
 }
 ```
 
@@ -1177,7 +1177,7 @@ car_model = "model{
 ```
 
 ```{r, echo = FALSE}
-if (!file.exists("car_lm_model.Rdata")) {
+if (!file.exists("output/car_lm_model.Rdata")) {
   m = rjags::jags.model(
     textConnection(car_model), 
     data = list(
@@ -1195,9 +1195,9 @@ if (!file.exists("car_lm_model.Rdata")) {
     m, variable.names=c("sigma2","tau", "beta", "omega", "phi", "y_pred"),
     n.iter=500000, thin=500
   )
-  save(car_coda, m, file="car_lm_model.Rdata")
+  save(car_coda, m, file="output/car_lm_model.Rdata")
 } else {
-  load("car_lm_model.Rdata")
+  load("output/car_lm_model.Rdata")
 }
 ```
 
@@ -1316,7 +1316,7 @@ car_model = "model{
 ```
 
 ```{r, echo = FALSE}
-if (!file.exists("car_lm_meo_model.Rdata")) {
+if (!file.exists("output/car_lm_meo_model.Rdata")) {
   m = rjags::jags.model(
     textConnection(car_model), 
     data = list(
@@ -1334,9 +1334,9 @@ if (!file.exists("car_lm_meo_model.Rdata")) {
     m, variable.names=c("sigma2","tau", "beta", "omega", "phi", "y_pred"),
     n.iter=500000, thin=500
   )
-  save(car_coda, m, file="car_lm_meo_model.Rdata")
+  save(car_coda, m, file="output/car_lm_meo_model.Rdata")
 } else {
-  load("car_lm_meo_model.Rdata")
+  load("output/car_lm_meo_model.Rdata")
 }
 ```
 
@@ -1503,7 +1503,7 @@ gplm = "model{
 ```
 
 ```{r, echo=FALSE, warning = FALSE}
-if (!file.exists("gplm.Rdata")) {
+if (!file.exists("output/gplm.Rdata")) {
   m = jags.model(
     textConnection(gplm), 
     data = list(
@@ -1519,9 +1519,9 @@ if (!file.exists("gplm.Rdata")) {
     m, variable.names=c("sigma2", "sigma2_w", "phi", "beta", "y_pred"),
     n.iter=5000, thin=5
   )
-  save(gplm_coda, file="gplm.Rdata")
+  save(gplm_coda, file="output/gplm.Rdata")
 } else {
-  load("gplm.Rdata")
+  load("output/gplm.Rdata")
 }
 
 # Prediciton
@@ -1651,15 +1651,15 @@ OneDay_df = OneDay_df %>%
 ```
 
 ```{r, echo =FALSE, warning = FALSE}
-if (!file.exists("splm.Rdata")) {
+if (!file.exists("output/splm.Rdata")) {
   m_pred = spBayes::spPredict(mod_spBayes, pred_coords, 
                               pred.covars = matrix(1, nrow=nrow(pred_coords)),
                     start=n_samp/2+1, thin=(n_samp/2)/1000)
   m_pred_summary = post_summary(t(m_pred$p.y.predictive.samples))
 
-  save(m_pred_summary, file="splm.Rdata")
+  save(m_pred_summary, file="output/splm.Rdata")
 } else {
-  load("splm.Rdata")
+  load("output/splm.Rdata")
 }
 
 splm_pm25_pred = r
@@ -1802,11 +1802,11 @@ m = spBayes::spDynLM(
 
 m = clean_spdynlm(m, n_samples/2+1, n_samples, (n_samples/2)/1000)
 
-save(m, file = "sp_temp_mod.Rdata")
+save(m, file = "output/sp_temp_mod.Rdata")
 ```
 
 ```{r, echo = FALSE}
-load("sp_temp_mod.Rdata")
+load("output/sp_temp_mod.Rdata")
 ```
 
 The following plots demonstrate the posterior inference of $\beta$'s, $\theta$ and the predicted value. From the observed v.s. predited plot, we can see that, our estimation is not very accurate, which may be because of inappropriate start point or prior of $\phi$.

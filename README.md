@@ -11,3 +11,12 @@ This projects consist of five major parts:
 
 A few data visualization examples are shown as follows:
 
+Pic 1: Beijing District
+![](https://github.com/lichunxiao9501/Final-Project-STA644-Temporal-and-Spatial-Model/blob/master/pics/beijing_districts.png)
+
+Pic 2: Beijing Air Quality and Meteorology Stations Distribution
+![](https://github.com/lichunxiao9501/Final-Project-STA644-Temporal-and-Spatial-Model/blob/master/pics/stations.png)
+
+Pic 3: Beijing PM2.5 Spatial Model Prediction
+![](https://github.com/lichunxiao9501/Final-Project-STA644-Temporal-and-Spatial-Model/blob/master/pics/spatial_predictions.png)
+
